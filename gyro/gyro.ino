@@ -1,23 +1,34 @@
+// имя точки в режиме AP
+#define GT_AP_SSID "MyGyro"
+#define GT_AP_PASS "12345678"
+
 #include <Wire.h>
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
+#include <SimplePortal.h> // by AlexGyver
+#include <EEManager.h> // by AlexGyver
 #include "MPU6050.h" // by jrowberg,
 #include "I2Cdev.h"  // https://github.com/jrowberg/i2cdevlib
 #include "CRC32.h"   // by bakercp, https://github.com/bakercp/CRC32
 
+WiFiServer server(80);
 WiFiUDP udp;
+EEManager EEwifi(portalCfg);
+IPAddress myIP;
 uint8_t  udpIn[28];
 uint8_t  udpInfoOut[32];
 uint8_t  udpDataOut[100];
 
 bool serialPlotting = false; // Change when using serial plotter
+
 int16_t accXI, accYI, accZI, gyrPI, gyrYI, gyrRI; // Raw integer orientation data
 float   accXF, accYF, accZF, gyrPF, gyrYF, gyrRF; // Float orientation data
 uint32_t dataPacketNumber = 0; // Current data packet count
 // All time variables are in microseconds
 uint32_t dataSendTime; // Current time
 uint32_t dataRequestTime; // Time of the last data request
-const uint32_t dataSendDelay = 75000; // Time between sending data packages
+//const uint32_t dataSendDelay = 5000; // Time between sending data packages in micros (another application net.sshnuke.dsu.MotionSource-1.1.2.apk sent aprox 2000packages/10sec = 5000 - that work for yuzu)
+const uint32_t dataSendDelay = 1000;
 const uint32_t dataRequestTimeout = 120000000; // Timeout time for data request
 
 const uint32_t infoResponseSize = 32;
@@ -29,8 +40,6 @@ bool delayDataPacket = false;
  * User Defined Data
 ****************************************************************************************/
 
-char wifiSSID[] = "********";
-char wifiPass[] = "********";
 uint16_t udpPort = 26760;
 
 const uint8_t MPU6050_sda = 4, MPU6050_scl = 5; // MPU6050 I2C GPIO connection
@@ -39,30 +48,30 @@ const uint8_t MPU_addr = 0x68; // I2C address of the MPU-6050
 
 int16_t* swapTable[] =
 {
-  &accZI,
   &accXI,
   &accYI,
-  &gyrRI,
+  &accZI,
   &gyrPI,
   &gyrYI,
+  &gyrRI,
 };
 bool signTable[] = // If true change sign
 {
-  false, // accXI
+  true,  // accXI
   false, // accYI
   true,  // accZI
-  true,  // gyrPI
+  false, // gyrPI
   false, // gyrYI
-  true,  // gyrRI
+  false,  // gyrRI
 };
 int16_t offsetTable[] =
 {
-  -2818, // accXI
-  2461, // accYI
-  1148, // accZI
-  -47, // gyrPI
-  -72, // gyrYI
-  35, // gyrRI
+  -1252, // accXI
+  2571, // accYI
+  1746, // accZI
+  -14, // gyrPI
+  60, // gyrYI
+  71, // gyrRI
 };
 
 
@@ -77,10 +86,10 @@ MPU6050 accgyr;
 // Gyro sensitivity 0: +/-250 deg/s, 1: +/-500 deg/s, 2: +/-1000 deg/s, 3: +/-2000 deg/s
 // If set too low it will introduce clipping
 // If set too high it will decrease sensitity
-const uint8_t gyroSens = 2;
+const uint8_t gyroSens = 3;
 const float gyroLSB = 131.0f / pow(2, gyroSens);
 
-// Info package response packet
+// Info package response packet https://v1993.github.io/cemuhook-protocol/
 uint8_t makeInfoPackage(uint8_t* output, uint8_t portNumber)
 {
   // Magic server string
@@ -186,8 +195,8 @@ uint8_t makeDataPackage(uint8_t* output,       uint32_t packetCount,  uint32_t t
   output[21] = 0x02; // Slot state, connected (2)
   output[22] = 0x02; // Device model, full gyro aka DS4 (2)
   output[23] = 0x02; // Connection type, bluetooth (2). (May be either USB (1) or Bluetooth (2))
-  // MAC address of device (0x000000000001)
-  output[24] = 0x01; 
+  // MAC address of device (0x000000000002)
+  output[24] = 0x02; 
   output[25] = 0x00;
   output[26] = 0x00;
   output[27] = 0x00;
@@ -251,19 +260,85 @@ uint8_t makeDataPackage(uint8_t* output,       uint32_t packetCount,  uint32_t t
   return 100; // Return the number of bytes in packet
 }
 
+void setupAP() {
+  Serial.print("AP Mode");
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(GT_AP_SSID, GT_AP_PASS);
+  myIP = WiFi.softAPIP();
+  server.begin();
+}
+
+void setupSTA() {
+  Serial.print("\nConnecting to ");
+  Serial.print(portalCfg.SSID);
+  Serial.print(" ... ");
+  WiFi.softAPdisconnect();
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(portalCfg.SSID, portalCfg.pass);
+  uint32_t tmr = millis();
+  bool state = false;
+  while (millis() - tmr < 15000) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("\nok");
+      myIP = WiFi.localIP();
+      return;
+    }
+    Serial.print(".");
+    yield();
+  }
+  Serial.print("\nfail");
+  setupAP();
+}
+
+void portalRoutine() {
+  // запускаем portal
+  portalStart();
+  Serial.print("\nPortal start");
+
+  // ждём действий пользователя
+  while (!portalTick()) Serial.print(".");
+
+  // если это 1 connect, 2 ap, 3 local, обновляем данные в епр
+  if (portalStatus() <= 3) EEwifi.updateNow();
+
+  Serial.print("\nPortal status: ");
+  Serial.print(portalStatus());
+}
+
+
+class CemuhookClient {
+  public:
+    CemuhookClient(){
+    }
+    bool isActive = false;
+    IPAddress ip;
+    uint16_t port;
+    uint8_t id;
+    uint32_t dataRequestTime;
+};
+
+uint8_t clientCount = 0;
+const uint8_t maxActiveClient = 10; // по протоколу - любое количество. По смыслу 1. При проверках, если вешать разных слушателей - штуки 3-4
+CemuhookClient clients[maxActiveClient];
+
 void setup() 
 {
   Serial.begin(74880);
+  
+  delay(200);
+  EEPROM.begin(2048); // с запасом!
 
-  Serial.print("\nConnecting");
-  WiFi.begin(wifiSSID, wifiPass);  
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-    Serial.print(".");
-  }   
-  Serial.print("\nConnected, IP address: ");          
-  Serial.print(WiFi.localIP());
+  // если это первый запуск, открываем портал. (САМЫЙ первый после перепрошивки - кнопок сброса нет - для изменения сбросить маркер на b )
+  if (EEwifi.begin(0, 'a')) portalRoutine();
+
+  // создаём точку или подключаемся к AP
+  if (portalCfg.mode == WIFI_AP || (portalCfg.mode == WIFI_STA && portalCfg.SSID[0] == '\0')) setupAP();
+  else setupSTA();
+  Serial.print("\nConnected, IP address: ");  
+  Serial.print(myIP);
+
 
   udp.begin(udpPort);
   Serial.print("\nUDP server has been set up at port: ");
@@ -283,18 +358,22 @@ void setup()
 
   dataRequestTime = micros(); // Set dataRequestTime, so that if we won't get a data request in time we will shutdown
 
-  Serial.println("Setup done!");     
+  Serial.println("Setup done!");
+
 }
+
 void loop() 
 {
   uint8_t packetInSize = udp.parsePacket();
   if (packetInSize)
   {
     udp.read(udpIn, sizeof(udpIn));
+    uint8_t clientId = udpIn[12];
+    
     switch(udpIn[16]) // udpIn[16] - Least significant byte of event type
     {
       case 0x01: // Information about controllers
-        Serial.println("Got info request!");        
+        //Serial.println("Got info request!");        
 
         for (uint8_t i = 0; i < udpIn[20]; i++) // udpIn[20] - Amount of ports we should report about
         {
@@ -304,11 +383,43 @@ void loop()
           udp.write(udpInfoOut, infoResponseSize);
           udp.endPacket();        
         }
-        shouldSend = false;
+        shouldSend = true;
       break;
       case 0x02: // Controller input data
-        Serial.println("Got data request!");      
-        
+        //Serial.println("Got data request!");
+        bool find = false;
+        for(auto &client : clients){
+          if(client.isActive && clientId == client.id) {
+            find = true;
+            client.ip = udp.remoteIP();
+            client.port = udp.remotePort();
+            client.dataRequestTime = micros();
+            //Serial.print(client.id);
+          }
+        }
+        //Serial.println("");
+
+        if (!find) {
+          for(auto &client : clients){
+            if(!client.isActive) {
+              client.isActive = true;
+              client.ip = udp.remoteIP();
+              client.port = udp.remotePort();
+              client.id = clientId;
+              client.dataRequestTime = micros();
+              clientCount++;
+
+              Serial.print("Connect client "); 
+              Serial.print(client.id); 
+              Serial.print(" : number of client is "); 
+              Serial.print(clientCount); 
+              Serial.println("..."); 
+              
+              break;
+            }
+          }
+        }
+
         dataRequestTime = micros(); // Refresh timeout timer        
         shouldSend = true;
       break;      
@@ -321,13 +432,18 @@ void loop()
     Serial.println("Shutting down..."); Serial.flush();
     ESP.deepSleep(0); 
   }
-  if (delayDataPacket && shouldSend)
-  {
-    udp.beginPacket(udp.remoteIP(), udp.remotePort());
-    udp.write(udpDataOut, dataResponseSize);
-    udp.endPacket();
-    delayDataPacket = false;
+  for(auto &client : clients){
+    if(client.isActive && micros() - client.dataRequestTime > dataRequestTimeout) {
+      client.isActive = false;
+      clientCount--;
+      Serial.print("Disconnect client "); 
+      Serial.print(client.id); 
+      Serial.print("number of client is "); 
+      Serial.print(clientCount); 
+      Serial.println("..."); 
+    }
   }
+ 
   if ((micros() - dataSendTime > dataSendDelay) && shouldSend) // Check if enough time has elapsed between data packets
   {            
     dataPacketNumber++; dataSendTime = micros();
@@ -373,13 +489,20 @@ void loop()
     
     makeDataPackage(&udpDataOut[0], dataPacketNumber, dataSendTime, accXF, accYF, accZF, gyrPF, gyrYF, gyrRF);
 
-    if (udp.parsePacket() == 0)
-    {
-      udp.beginPacket(udp.remoteIP(), udp.remotePort());
-      udp.write(udpDataOut, dataResponseSize);
-      udp.endPacket();
+    for(auto &client : clients){
+      if(client.isActive) {
+        udp.beginPacket(client.ip, client.port);
+        udp.write(udpDataOut, dataResponseSize);
+        udp.endPacket();
+        
+        // Serial.print("Send to client "); 
+        // Serial.print(client.id); 
+        // Serial.print(" ip "); 
+        // Serial.print(client.ip); 
+        // Serial.print(" port "); 
+        // Serial.print(client.port); 
+        // Serial.println("..."); 
+      }
     }
-    else    
-      delayDataPacket = true;
   }
 }
